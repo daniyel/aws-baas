@@ -50,6 +50,11 @@ Parameters:
     Description: VPC that will be used for target group.
     Type: AWS::EC2::VPC::Id
 
+  LoadBalancerHost:
+    Description: Hostname of the load balancer where BaaS servers are running.
+    Type: String
+
+
 Mappings:
 
   EnvironmentMapping:
@@ -125,6 +130,8 @@ Resources:
           Environment:
             - Name: NODE_ENV
               Value: !Ref EnvironmentName
+            - Name: LB_HOST
+              Value: !Ref LoadBalancerHost
           DockerLabels:
             traefik.frontend.rule: !Sub "PathPrefixStrip: /api/${ServiceName}"
             traefik.enable: "true"
