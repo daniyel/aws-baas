@@ -1,0 +1,406 @@
+Description: This template creates bcrypt as a service with Auto-Scaling.
+
+Parameters:
+
+  SSHKeyName:
+    Description: The EC2 Key Pair to allow SSH access to the instances.
+    Type: String
+    Default: baas-server
+
+  InstanceType:
+    AllowedValues:
+      - t2.nano
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - m3.large
+      - m3.xlarge
+      - m3.2xlarge
+      - m4.large
+      - m4.xlarge
+      - m4.2xlarge
+      - m4.4xlarge
+    Default: t2.micro
+    Description: Amazon EC2 instance type for the baas server instances.
+    Type: String
+
+  MinimumSize:
+    Description: Minumum size of BaaS server instances.
+    Type: String
+    Default: 1
+
+  MaximumSize:
+    Description: Maximum size of BaaS server instances.
+    Type: String
+    Default: 5
+
+  EmailAlerts:
+    Description: Email used for notifications when auto scaling occurs.
+    Type: String
+
+  VpcId:
+    Description: VPC id that will be used for stack.
+    Type: AWS::EC2::VPC::Id
+
+  PublicSubnetList:
+    Description: >
+      List of subnet IDs that will be used as public.
+      Should always be in a (AZ1), b (AZ2) and c (AZ3) order.
+    Type: List<AWS::EC2::Subnet::Id>
+
+  PrivateSubnetList:
+    Description: >
+      List of subnet IDs that will be used as private.
+      Should always be in a (AZ1), b (AZ2) and c (AZ3) order.
+    Type: List<AWS::EC2::Subnet::Id>
+
+  CertificateId:
+    Description: Certificate ID to be used with load balancer.
+    Type: String
+
+
+Mappings:
+
+  AWSRegionToAMI:
+    us-east-1:
+      US1604HVM: ami-04169656fea786776
+    us-west-1:
+      US1604HVM: ami-059e7901352ebaef8
+    ap-northeast-3:
+      US1604HVM: ami-06ad95b4dfffa1d22
+    ap-northeast-2:
+      US1604HVM: ami-00ca7ffe117e2fe91
+    ap-northeast-1:
+      US1604HVM: ami-02115cef40fbb46a4
+    sa-east-1:
+      US1604HVM: ami-08b78b890b5a86161
+    ap-southeast-1:
+      US1604HVM: ami-03221428e6676db69
+    ca-central-1:
+      US1604HVM: ami-9526abf1
+    ap-southeast-2:
+      US1604HVM: ami-059b78064586da1b7
+    us-west-2:
+      US1604HVM: ami-51537029
+    us-east-2:
+      US1604HVM: ami-0552e3455b9bc8d50
+    ap-south-1:
+      US1604HVM: ami-00b7e666605d33085
+    eu-central-1:
+      US1604HVM: ami-027583e616ca104df
+    eu-west-1:
+      US1604HVM: ami-0181f8d9b6f098ec4
+    eu-west-2:
+      US1604HVM: ami-c7ab5fa0
+    eu-west-3:
+      US1604HVM: ami-0370f4064dbc392b9
+    cn-north-1:
+      US1604HVM: ami-0987442b0b3be4589
+    cn-northwest-1:
+      US1604HVM: ami-085d69987e6675f08
+    us-gov-west-1:
+      US1604HVM: ami-3a4dd15b
+
+
+Resources:
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref EmailAlerts
+          Protocol: email
+      TopicName:
+        Fn::Sub: ${AWS::StackName}-AlertsTopic
+
+  BaaSASG:
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: '1'
+        MaxBatchSize: '1'
+        PauseTime: PT12M5S
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref PrivateSubnetList
+      LaunchConfigurationName:
+        Ref: LaunchConfiguration
+      MinSize: !Ref MinimumSize
+      MaxSize: !Ref MaximumSize
+      DesiredCapacity: !Ref MinimumSize
+      LoadBalancerNames:
+        - Ref: ElasticLoadBalancer
+      NotificationConfiguration:
+        TopicARN:
+          Ref: AlertsTopic
+        NotificationTypes:
+          - autoscaling:EC2_INSTANCE_LAUNCH
+          - autoscaling:EC2_INSTANCE_TERMINATE
+          - autoscaling:EC2_INSTANCE_LAUNCH_ERROR
+          - autoscaling:EC2_INSTANCE_TERMINATE_ERROR
+      Tags:
+        - Key: Environment
+          Value: infrastructure
+          PropagateAtLaunch: 'true'
+        - Key: Type
+          Value: BaasServerInstanceASG
+          PropagateAtLaunch: 'true'
+        - Key: Name
+          Value: baas-server
+          PropagateAtLaunch: 'true'
+
+  BaaSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      RoleName: !Sub BaaSRole-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+      Policies:
+          - PolicyName: ecs-service
+            PolicyDocument:
+              Statement:
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - ec2:DescribeInstanceStatus
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - cloudformation:SignalResource
+                Resource: '*'
+
+  BaaSServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+        Path: /
+        Roles:
+          - !Ref BaaSRole
+
+  BaaSWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  BaaSWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: BaaSASG
+    Properties:
+      Handle: !Ref BaaSWaitHandle
+      Timeout: 300
+      Count: !Ref MinimumSize
+
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !FindInMap [AWSRegionToAMI, !Ref 'AWS::Region', US1604HVM]
+      InstanceType: !Ref InstanceType
+      SecurityGroups:
+        - !Ref BaasSServerSecurityGroup
+      KeyName: !Ref SSHKeyName
+      IamInstanceProfile: !Ref BaaSServerInstanceProfile
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash -xe
+              apt-get -y update && apt-get -y install python-pip && echo "PIP INSTALLED"
+
+              pip install --upgrade pip &> /dev/null
+              easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+
+              # Call CFN-INIT to process the metadata for CloudFormation Init.
+              cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource LaunchConfiguration
+
+              # Install awslogs
+              curl https://s3.amazonaws.com//aws-cloudwatch/downloads/latest/awslogs-agent-setup.py -O
+              chmod +x ./awslogs-agent-setup.py
+              ./awslogs-agent-setup.py -n -r ${AWS::Region} -c /etc/awslogs/awslogs.conf
+
+              # install docker CE
+              apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+              apt-key fingerprint 0EBFCD88
+              sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+              apt-get update
+              apt-get install -y docker-ce
+
+              # setup auth0/baas
+              cd /home/ubuntu/baas
+              docker build -t baas-server .
+              docker run -d -p 9485:9485 --log-driver=syslog --log-opt tag=baas-server --restart=always baas-server
+
+              # If all went well the response should be true
+              RUNNING=$(docker inspect -f {{.State.Running}} $(docker container ls -q))
+              cfn-signal -s $RUNNING -e $? '${WaitHandle}'
+            - WaitHandle: !Ref BaaSWaitHandle
+
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            apt:
+              awscli: []
+              logrotate: []
+          files:
+            "/etc/awslogs/awslogs.conf":
+              content: !Sub |
+                [general]
+                state_file = /var/awslogs/state/agent-state
+
+                [/var/log/cloud-init.log]
+                file = /var/log/cloud-init.log
+                log_group_name = ${AWS::StackName}-/var/log/cloud-init.log
+                log_stream_name = ${AWS::StackName}
+                datetime_format = %Y-%m-%dT%H:%M:%SZ
+
+                [/var/log/syslog]
+                file = /var/log/syslog
+                log_group_name = ${AWS::StackName}-/var/log/syslog
+                log_stream_name = ${AWS::StackName}
+                datetime_format = %Y-%m-%dT%H:%M:%SZ
+
+            "/etc/systemd/system/awslogs.service":
+              content: !Sub |
+                [Unit]
+                Description=Service for CloudWatch Logs agent
+                After=rc-local.service
+
+                [Service]
+                Type=simple
+                Restart=always
+                KillMode=process
+                TimeoutSec=infinity
+                PIDFile=/var/awslogs/state/awslogs.pid
+                ExecStart=/var/awslogs/bin/awslogs-agent-launcher.sh --start --background --pidfile $PIDFILE --user awslogs --chuid awslogs &
+
+                [Install]
+                WantedBy=multi-user.target
+              mode: '000664'
+              owner: root
+              group: root
+
+            "/home/ubuntu/baas/Dockerfile":
+              content: !Sub |
+                FROM node:8.11.2
+
+                WORKDIR /app
+
+                RUN apt-get install -y git && \
+                    git clone https://github.com/auth0/node-baas.git . && \
+                    git checkout 866dbf687e0f96776c210673623460b4c55886da && \
+                    npm i && \
+                    ls -al && \
+                    rm -rf /var/lib/apt/lists/*
+
+                EXPOSE 9485
+
+                CMD ["./bin/baas", "-p", "9485", "-s", "10"]
+              mode: '000664'
+              owner: ubuntu
+              group: ubuntu
+
+  BaaSServerScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: PercentChangeInCapacity
+      AutoScalingGroupName:
+        Ref: BaaSASG
+      Cooldown: 300
+      ScalingAdjustment: 100
+
+  BaaSServerScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName:
+        Ref: BaaSASG
+      Cooldown: 600
+      ScalingAdjustment: -1
+
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'CPU utilization greater than 80% for ${AWS::StackName}'
+      AlarmDescription: 'Scale-up if CPU > 80% for 10 minutes'
+      MetricName: CPUUtilization
+      Namespace: 'AWS/EC2'
+      Statistic: Average
+      Period: 120
+      EvaluationPeriods: 5
+      Threshold: 80
+      AlarmActions:
+        - Ref: BaaSServerScaleUpPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value:
+            Ref: BaaSASG
+      ComparisonOperator: GreaterThanThreshold
+
+  CPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'CPU utilization lower than 40% for ${AWS::StackName}'
+      AlarmDescription: 'Scale-down if CPU <40% for 60 min'
+      MetricName: CPUUtilization
+      Namespace: 'AWS/EC2'
+      Statistic: Average
+      Period: 120
+      EvaluationPeriods: 30
+      Threshold: 40
+      AlarmActions:
+        - Ref: BaaSServerScaleDownPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value:
+            Ref: BaaSASG
+      ComparisonOperator: LessThanThreshold
+
+  ElasticLoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      Subnets: !Ref PublicSubnetList
+      Listeners:
+        - LoadBalancerPort: 9485
+          Protocol: SSL
+          InstancePort: 9485
+          InstanceProtocol: TCP
+          SSLCertificateId: !Sub "arn:aws:acm:${AWS::Region}:${AWS::AccountId}:certificate/${CertificateId}"
+          PolicyNames:
+            - "ELBSecurityPolicy-2016-08"
+      HealthCheck:
+        Target:
+          Fn::Join: [ '', ['TCP:', '9485']]
+        HealthyThreshold: 3
+        UnhealthyThreshold: 3
+        Interval: 30
+        Timeout: 10
+      SecurityGroups:
+        - !Ref BaasSServerSecurityGroup
+      LoadBalancerName: lb-baas
+      Tags:
+        - Key: Environment
+          Value: infrastructure
+
+  BaasSServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Enable SSH access and BaaS servie access on the inbound port'
+      GroupName: BaasSecurityGroup
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: 'tcp'
+          FromPort: 9485
+          ToPort: 9485
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: 'tcp'
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: sg-baas

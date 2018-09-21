@@ -1,0 +1,220 @@
+Description: >
+    This template deploys a Bcrypt as a Service client to ECS Cluster.
+
+Parameters:
+
+  EnvironmentName:
+    Description: Development or production environment.
+    Type: String
+    Default: development
+    AllowedValues:
+      - development
+      - production
+
+  DockerContainerPort:
+    Description: Internal port used for docker container.
+    Type: Number
+    Default: 3000
+    AllowedValues:
+      - 3000
+
+  Tag:
+    Description: Tag that will be used to deploy container.
+    Type: String
+    Default: latest
+    AllowedValues:
+      - latest
+      - development
+      - production
+
+  ServiceName:
+    Description: Name of the microservice.
+    Type: String
+    Default: baas-client
+    AllowedValues:
+      - baas-client
+
+  ImageRepository:
+    Description: Name of the service image repository.
+    Type: String
+    Default: infrastructure/baas-client
+    AllowedValues:
+      - infrastructure/baas-client
+
+  MemoryInMb:
+    Description: Amount of memory we want to dedicate to service.
+    Type: String
+    Default: 80
+
+  VPC:
+    Description: VPC that will be used for target group.
+    Type: AWS::EC2::VPC::Id
+
+Mappings:
+
+  EnvironmentMapping:
+    development:
+      DesiredCount: 1
+      MinCapacity: 1
+      MaxCapacity: 2
+      Cpu: 256
+    production:
+      DesiredCount: 2
+      MinCapacity: 2
+      MaxCapacity: 5
+      Cpu: 256
+
+Resources:
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref AWS::StackName
+      RetentionInDays: 30
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Sub ${EnvironmentName}-ECSCluster
+      ServiceName: !Sub ${EnvironmentName}-${ServiceName}
+      DesiredCount: !FindInMap [EnvironmentMapping, !Ref 'EnvironmentName', DesiredCount]
+      TaskDefinition: !Ref TaskDefinition
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      PlacementStrategies:
+        - Type: spread
+          Field: 'attribute:ecs.availability-zone'
+        - Type: spread
+          Field: instanceId
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "ecs-tasks.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${EnvironmentName}-${ServiceName}
+      NetworkMode: bridge
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub ${ServiceName}
+          Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ImageRepository}:${Tag}
+          Memory: !Ref MemoryInMb
+          Cpu: !FindInMap [EnvironmentMapping, !Ref 'EnvironmentName', Cpu]
+          PortMappings:
+            - ContainerPort: !Ref DockerContainerPort
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+          Environment:
+            - Name: NODE_ENV
+              Value: !Ref EnvironmentName
+          DockerLabels:
+            traefik.frontend.rule: !Sub "PathPrefixStrip: /api/${ServiceName}"
+            traefik.enable: "true"
+            traefik.protocol: "http"
+            traefik.backend.loadbalancer.method: "wrr"
+            traefik.backend.loadbalancer.stickiness: "false"
+            traefik.backend.healthcheck.path: "/health"
+            traefik.backend.healthcheck.interval: "10s"
+      Cpu: !FindInMap [EnvironmentMapping, !Ref 'EnvironmentName', Cpu]
+
+  ServiceScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !FindInMap [EnvironmentMapping, !Ref 'EnvironmentName', MaxCapacity]
+      MinCapacity: !FindInMap [EnvironmentMapping, !Ref 'EnvironmentName', MinCapacity]
+      ResourceId: !Join
+          - /
+          - - service
+            - !Sub ${EnvironmentName}-ECSCluster
+            - !GetAtt Service.Name
+      RoleARN:
+        Fn::ImportValue:
+          !Sub ${EnvironmentName}-ECSServiceAutoScalingRoleArn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ServiceScaleOutPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ServiceScaleOutPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ServiceScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 1800
+        MetricAggregationType: Average
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            ScalingAdjustment: 1
+
+  ServiceScaleInPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ServiceScaleInPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ServiceScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 1800
+        MetricAggregationType: Average
+        StepAdjustments:
+          - MetricIntervalUpperBound: 0
+            ScalingAdjustment: -1
+
+  CPUScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "CPU utilization greater than 90% for ${AWS::StackName}"
+      AlarmDescription: Alarm if cpu utilization greater than 90% of reserved cpu
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: ClusterName
+          Value: !Sub ${EnvironmentName}-ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt Service.Name
+      Statistic: Maximum
+      Period: '60'
+      EvaluationPeriods: '3'
+      Threshold: '90'
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ServiceScaleOutPolicy
+
+  CPUScaleInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "CPU utilization less than 70% for ${AWS::StackName}"
+      AlarmDescription: Alarm if cpu utilization greater than 70% of reserved cpu
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: ClusterName
+          Value: !Sub ${EnvironmentName}-ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt Service.Name
+      Statistic: Maximum
+      Period: '60'
+      EvaluationPeriods: '10'
+      Threshold: '70'
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref ServiceScaleInPolicy
